@@ -1,0 +1,114 @@
+import cv2
+import dlib
+import mediapipe as mp
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+from retinaface import RetinaFace  # Make sure the correct RetinaFace package is imported
+
+# Initialize Mediapipe Face Detection
+mp_face_detection = mp.solutions.face_detection
+mp_drawing = mp.solutions.drawing_utils
+
+# Initialize Dlib Face Detection and Landmark Predictor
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor('shape_predictor_81_face_landmarks.dat')  # Ensure file is in your directory
+
+# OpenCV Webcam Capture
+cap = cv2.VideoCapture(0)  # Use 0 for default camera
+
+# Thread pool for concurrent face detection and processing
+executor = ThreadPoolExecutor(max_workers=3)  # Increased to handle all detections concurrently
+
+# Function to preprocess the frame for low light and high-contrast scenarios
+def preprocess_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # CLAHE for contrast enhancement only under low-light conditions
+    if np.mean(gray) < 80:  # Only apply CLAHE if the image is too dark
+        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+        enhanced_gray = clahe.apply(gray)
+    else:
+        enhanced_gray = gray
+
+    # Apply Gamma correction for low-light conditions
+    gamma = 2.0 if np.mean(gray) < 80 else 1.2
+    look_up_table = np.array([((i / 255.0) ** (1.0 / gamma)) * 255 for i in np.arange(0, 256)]).astype("uint8")
+    corrected_gray = cv2.LUT(enhanced_gray, look_up_table)
+
+    # Convert back to BGR for consistency
+    return cv2.cvtColor(corrected_gray, cv2.COLOR_GRAY2BGR)
+
+# Function for Mediapipe Face Detection
+def mediapipe_detection(frame, face_detection):
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_detection.process(rgb_frame)
+    return results
+
+# Function for Dlib Face and Eye Detection
+def dlib_detection(frame, detector, predictor):
+    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = detector(gray_frame, 1)  # Multi-scale detection
+    for face in faces:
+        landmarks = predictor(gray_frame, face)
+        # Draw landmarks
+        for i in range(0, 81):
+            x, y = landmarks.part(i).x, landmarks.part(i).y
+            color = (0, 255, 0) if 36 <= i <= 47 else (255, 0, 0)  # Green for eyes, blue for other landmarks
+            cv2.circle(frame, (x, y), 2, color, -1)
+    return frame
+
+# Function for RetinaFace Face Detection (only every few frames for efficiency)
+def retinaface_detection(frame, frame_count):
+    # Run RetinaFace on every frame
+    faces = RetinaFace.detect_faces(frame)  # RetinaFace should detect faces without needing model='mobilenet0.25'
+    return faces
+
+# Mediapipe setup
+with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.8) as face_detection:
+    frame_count = 0  # Counter for RetinaFace frequency
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame. Exiting...")
+            break
+
+        # Flip frame horizontally
+        frame = cv2.flip(frame, 1)
+
+        # Preprocess the frame
+        enhanced_frame = preprocess_frame(frame)
+
+        # Run face detection models in parallel
+        future_mediapipe = executor.submit(mediapipe_detection, enhanced_frame, face_detection)
+        future_dlib = executor.submit(dlib_detection, enhanced_frame, detector, predictor)
+        future_retinaface = executor.submit(retinaface_detection, enhanced_frame, frame_count)
+
+        # Collect results
+        results_mediapipe = future_mediapipe.result()
+        frame_with_dlib = future_dlib.result()
+        retina_faces = future_retinaface.result()
+
+        # Overlay Mediapipe detections
+        if results_mediapipe.detections:
+            for detection in results_mediapipe.detections:
+                mp_drawing.draw_detection(frame_with_dlib, detection)
+
+        # Overlay RetinaFace detections (only if detected)
+        if retina_faces:
+            for face in retina_faces.values():
+                (x1, y1, x2, y2) = face['facial_area']
+                cv2.rectangle(frame_with_dlib, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+        # Display the frame
+        cv2.imshow("Enhanced Face Detection", frame_with_dlib)
+
+        # Increment frame count
+        frame_count += 1
+
+        # Break condition
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+# Release resources
+cap.release()
+cv2.destroyAllWindows()
